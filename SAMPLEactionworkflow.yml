@@ -1,0 +1,253 @@
+name: POI API CI/CD Pipeline
+env: 
+  working-directory: apis/poi/
+  acr-name: openhackfwl15lz6acr
+  resource-group: openhackfwl15lz6rg
+  app-service-name: openhackfwl15lz6poi
+  deploy-ref: refs/heads/master
+  repository-name: devopsoh/api-poi
+  PAT: ${{ secrets.AZURE_DEVOPS_ACCESS_TOKEN }}
+  GithubToken: ${{ secrets.GITHUB_TOKEN}}
+  slot-name: staging
+
+on:
+  push:
+    paths:
+    - 'apis/poi/**'
+  pull_request:
+    branches: [ master ]
+    paths:
+    - 'apis/poi/**'
+      
+jobs: 
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v2
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v1
+    
+    - name: Restore dependencies
+      run: dotnet restore
+      working-directory: ${{env.working-directory}}
+      
+    - name: Build
+      run: dotnet build --no-restore 
+      working-directory: ${{env.working-directory}}
+      
+    - name: Test
+      run: dotnet test --no-build --verbosity normal
+      working-directory: ${{env.working-directory}}
+      
+    - name: Create Bug for Failed Build
+      uses: stefanstranger/azuredevops-bug-action@1.1
+      if: failure()
+      with:
+        OrganizationName: "hacker1dn2"
+        PAT: "PAT"
+        ProjectName: "TripViewer"
+        AreaPath: "TripViewer"
+        IterationPath: "TripViewer"
+        GithubToken: "GithubToken"
+        WorkflowFileName: "poi-api-ci-pipeline.yml"
+        
+    - name: Upload build artifacts
+      uses: actions/upload-artifact@v2
+      if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+      with:
+        name: build
+        path: ${{ env.working-directory }}web/
+          
+  push-acr:
+    runs-on: ubuntu-latest
+    needs: [build]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+    
+    steps:
+    - name: Download build
+      uses: actions/download-artifact@v2
+      with:
+        name: build
+      
+    - name: Log in with Azure
+      uses: azure/login@v1
+      with:
+        creds: '${{ secrets.AZURE_APP_LOGIN }}'
+
+    - name: Build/Push Docker Container
+      run: az acr build --image "${{ env.repository-name }}:${{ github.run_number }}" --registry ${{ env.acr-name }} --file Dockerfile .
+      
+    - name: Create Bug for Failed Docker Build/Push
+      uses: stefanstranger/azuredevops-bug-action@1.1
+      if: failure()
+      with:
+        OrganizationName: "hacker1dn2"
+        PAT: "PAT"
+        ProjectName: "TripViewer"
+        AreaPath: "TripViewer"
+        IterationPath: "TripViewer"
+        GithubToken: "GithubToken"
+        WorkflowFileName: "poi-api-ci-pipeline.yml"
+      
+  deploy-staging:
+    runs-on: ubuntu-latest
+    needs: [push-acr]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+    
+    steps:
+    - name: Log in with Azure
+      uses: azure/login@v1
+      with:
+        creds: '${{ secrets.AZURE_APP_LOGIN }}'
+    
+    - name: Deploy Container to App Service
+      uses: azure/webapps-deploy@v2
+      with:
+        app-name: ${{ env.app-service-name }}
+        slot-name: ${{ env.slot-name }}
+        images: ${{ env.acr-name }}.azurecr.io/${{ env.repository-name }}:${{ github.run_number }}
+        
+    - name: Start staging app service 
+      run: az webapp start -g ${{ env.resource-group }} -n ${{ env.app-service-name }} --slot staging
+    
+    - name: Create Bug for Failed Deploy
+      uses: stefanstranger/azuredevops-bug-action@1.1
+      if: failure()
+      with:
+        OrganizationName: "hacker1dn2"
+        PAT: "PAT"
+        ProjectName: "TripViewer"
+        AreaPath: "TripViewer"
+        IterationPath: "TripViewer"
+        GithubToken: "GithubToken"
+        WorkflowFileName: "poi-api-ci-pipeline.yml"
+        
+  validate-staging:
+    runs-on: ubuntu-latest
+    needs: [deploy-staging]
+    steps:
+      - name: Log in with Azure
+        uses: azure/login@v1
+        with:
+          creds: '${{ secrets.AZURE_APP_LOGIN }}'
+
+      - name: Check the deployed service URL
+        uses: jtalk/url-health-check-action@v1.4
+        with:
+          # Check the following URLs one by one sequentially
+          url: https://openhackfwl15lz6poi-staging.azurewebsites.net/api/healthcheck/poi
+          # Follow redirects, or just report success on 3xx status codes
+          follow-redirect: no # Optional, defaults to "no"
+          # Fail this action after this many failed attempts
+          max-attempts: 8 # Optional, defaults to 1
+          # Delay between retries
+          retry-delay: 15s # Optional, only applicable to max-attempts > 1
+
+      - name: Validate container tag in staging
+        run: |
+          az webapp config container show -g ${{ env.resource-group }} -n ${{ env.app-service-name }} --slot staging > container-config.txt
+          imageName='api-poi:${{ github.run_number}}'
+          grep $imageName container-config.txt > container-out.txt
+          theFileSize=$(wc -c container-out.txt | awk '{print $1}')
+          echo $theFileSize
+          if (("0" == "$theFileSize")); then
+            exit 1
+          else 
+            exit 0
+          fi
+        shell: bash
+
+      - name: Create Bug for Failed Staging validation
+        uses: stefanstranger/azuredevops-bug-action@1.1
+        if: failure()
+        with:
+          OrganizationName: "hacker1dn2"
+          PAT: "PAT"
+          ProjectName: "TripViewer"
+          AreaPath: "TripViewer"
+          IterationPath: "TripViewer"
+          GithubToken: "GithubToken"
+          WorkflowFileName: "poi-api-ci-pipeline.yml"
+      
+  deploy-production:
+    runs-on: ubuntu-latest
+    needs: [validate-staging]
+    steps:
+      - name: Log in with Azure
+        uses: azure/login@v1
+        with:
+          creds: '${{ secrets.AZURE_APP_LOGIN }}'
+        
+      - name: Swap staging/production deployment slots
+        run: az webapp deployment slot swap -g ${{ env.resource-group }} -n ${{ env.app-service-name }} --slot staging --target-slot production
+  
+  validate-production:
+    runs-on: ubuntu-latest
+    needs: [deploy-production]
+    steps:
+      - name: Log in with Azure
+        uses: azure/login@v1
+        with:
+          creds: '${{ secrets.AZURE_APP_LOGIN }}'
+
+      - name: Check the deployed service URL
+        uses: jtalk/url-health-check-action@v1.4
+        with:
+          # Check the following URLs one by one sequentially
+          url: https://openhackfwl15lz6poi.azurewebsites.net/api/healthcheck/poi
+          # Follow redirects, or just report success on 3xx status codes
+          follow-redirect: no # Optional, defaults to "no"
+          # Fail this action after this many failed attempts
+          max-attempts: 8 # Optional, defaults to 1
+          # Delay between retries
+          retry-delay: 15s # Optional, only applicable to max-attempts > 1
+      - name: Validate container tag in production
+        run: |
+          az webapp config container show -g ${{ env.resource-group }} -n ${{ env.app-service-name }} > container-config.txt
+          imageName='api-poi:${{ github.run_number}}'
+          grep $imageName container-config.txt > container-out.txt
+          theFileSize=$(wc -c container-out.txt | awk '{print $1}')
+          echo $theFileSize
+          if (("0" == "$theFileSize")); then
+            exit 1
+          else 
+            exit 0
+          fi
+        shell: bash
+        
+  clean-up-slots:
+    runs-on: ubuntu-latest
+    needs: [validate-production]
+    steps:
+      - name: Log in with Azure
+        uses: azure/login@v1
+        with:
+          creds: '${{ secrets.AZURE_APP_LOGIN }}'
+            
+      - name: Stop staging app service 
+        run: az webapp stop -g ${{ env.resource-group }} -n ${{ env.app-service-name }} --slot staging
+      
+  rollback-production:
+      runs-on: ubuntu-latest
+      needs: [validate-production]
+      if: (needs.validate-production.outputs.job_status == 'failure')
+      steps:
+        - name: Log in with Azure
+          uses: azure/login@v1
+          with:
+            creds: '${{ secrets.AZURE_APP_LOGIN }}'
+        
+        - name: Swap staging/production deployment slots
+          run: az webapp deployment slot swap -g ${{ env.resource-group }} -n ${{ env.app-service-name }} --slot staging --target-slot production
+          
+        - name: Create Bug for Failed Production validation
+          uses: stefanstranger/azuredevops-bug-action@1.1
+          with:
+            OrganizationName: "hacker1dn2"
+            PAT: "PAT"
+            ProjectName: "TripViewer"
+            AreaPath: "TripViewer"
+            IterationPath: "TripViewer"
+            GithubToken: "GithubToken"
+            WorkflowFileName: "poi-api-ci-pipeline.yml"
